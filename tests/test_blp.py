@@ -26,6 +26,7 @@ from pyblp import (
     Optimization,
     Problem,
     Simulation,
+    build_id_data,
     build_ownership,
     data_to_dict,
     parallel,
@@ -1535,6 +1536,64 @@ def test_mpec_matches_nfp(simulated_problem: SimulatedProblemFixture, mpec_metho
     np.testing.assert_allclose(mpec_results.beta, results.beta, atol=1e-4, rtol=1e-4)
     np.testing.assert_allclose(mpec_results.sigma_se, results.sigma_se, atol=1e-3, rtol=1e-2)
     np.testing.assert_allclose(mpec_results.beta_se, results.beta_se, atol=1e-3, rtol=1e-2)
+
+
+@pytest.mark.parametrize('mpec_method', [
+    pytest.param('mpec-trust-constr', id="SciPy Trust Region"),
+    pytest.param('mpec-knitro', id="Knitro"),
+])
+def test_mpec_matches_nfp_with_fixed_effects(mpec_method: str) -> None:
+    """Test that MPEC matches NFP when demand-side fixed effects are absorbed. None of the simulations underlying the
+    simulated_problem fixture use fixed effect absorption, so this is a dedicated regression test for it: delta must
+    be re-residualized by _build_mpec_objective_function on every evaluation (unlike X1 and the demand instruments,
+    which are only residualized once, when the problem is initialized), since it's the only piece of the objective
+    that changes from one evaluation to the next. Simulation does not support fixed effect absorption directly (see
+    Simulation's docstring), so, following the pattern used elsewhere in this test suite for testing absorption, an
+    arbitrary demand-side fixed effect unrelated to the simulated data-generating process is added after simulating
+    data without one, and a new problem is built with it absorbed.
+    """
+    id_data = build_id_data(T=3, J=18, F=3)
+    simulation = Simulation(
+        product_formulations=(
+            Formulation('0 + prices + x'),
+            Formulation('0 + x'),
+            Formulation('0 + a + b'),
+        ),
+        product_data={'market_ids': id_data.market_ids, 'firm_ids': id_data.firm_ids},
+        beta=[-5, 1],
+        sigma=2,
+        gamma=[2, 1],
+        integration=Integration('product', 3),
+        xi_variance=0.001,
+        omega_variance=0.001,
+        seed=0,
+    )
+    simulation_results = simulation.replace_endogenous()
+    demand_instruments, _ = simulation_results._compute_default_instruments()
+
+    # build a demand-only problem with an arbitrary demand-side fixed effect absorbed into X1
+    product_data = {k: simulation_results.product_data[k] for k in simulation_results.product_data.dtype.names}
+    product_data['demand_instruments'] = demand_instruments
+    product_data['demand_ids'] = np.random.RandomState(0).choice(['a', 'b', 'c'], simulation.N)
+    product_formulations = (Formulation('0 + prices + x', absorb='demand_ids'), Formulation('0 + x'))
+    problem = Problem(product_formulations, product_data, integration=simulation.integration)
+
+    # configure the MPEC method, skipping Knitro tests when it isn't installed or licensed in this environment
+    try:
+        optimization = Optimization(mpec_method)
+    except OSError as exception:
+        return pytest.skip(f"Failed to use the {mpec_method} method in this environment: {exception}.")
+
+    nfp_results = problem.solve(sigma=simulation.sigma, method='1s')
+    mpec_results = problem.solve(
+        sigma=nfp_results.sigma, optimization=optimization, delta=nfp_results.delta, method='1s',
+    )
+    np.testing.assert_allclose(mpec_results.theta, nfp_results.theta, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(mpec_results.objective, nfp_results.objective, atol=1e-8, rtol=1e-3)
+    np.testing.assert_allclose(mpec_results.xi, nfp_results.xi, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(mpec_results.beta, nfp_results.beta, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(mpec_results.sigma_se, nfp_results.sigma_se, atol=1e-3, rtol=1e-2)
+    np.testing.assert_allclose(mpec_results.beta_se, nfp_results.beta_se, atol=1e-3, rtol=1e-2)
 
 
 @pytest.mark.usefixtures('simulated_problem')

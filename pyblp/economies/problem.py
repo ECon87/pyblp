@@ -1040,15 +1040,24 @@ class ProblemEconomy(Economy):
             raise NotImplementedError("MPEC methods do not currently support unfixed phi (autocorrelation) parameters.")
 
     def _build_mpec_objective_function(
-        self, parameters: Parameters, iv: IV, W: Array, scale_objective: bool,
+        self, parameters: Parameters, iv: IV, W: Array, scale_objective: bool, error_behavior: str,
     ) -> MPECObjectiveFunction:
         """Build a function that computes the MPEC objective and its gradient at a stacked (theta, delta) vector.
 
         With beta fully concentrated out, no supply side, and 'levels' demand moments (all enforced by
-        _validate_mpec), xi = (I - X1 @ iv.covariances @ (X1'ZD) @ W) @ delta is an affine function of delta alone:
-        X1, ZD, iv.covariances, and W are all fixed within a GMM step and do not depend on theta. Hence the GMM
-        objective g(xi)'Wg(xi) and its exact gradient have zero dependence on theta -- all theta-dependence enters
-        only through the equilibrium constraint built by _build_mpec_constraint_function.
+        _validate_mpec), xi = (I - X1 @ iv.covariances @ (X1'ZD) @ W) @ M(delta) is an affine function of delta
+        alone, where M is the identity if there are no demand-side fixed effects, and otherwise the linear
+        fixed-effect-residualizing operator applied by self._absorb_demand_ids: X1 and ZD are already residualized
+        once (by self._absorb_demand_ids, called during __init__) and, along with iv.covariances and W, are fixed
+        within a GMM step and do not depend on theta. delta is the only piece that changes every evaluation and, if
+        there are fixed effects, must therefore be residualized every evaluation, exactly as it is for the standard
+        NFP objective in _compute_progress. Hence the GMM objective g(xi)'Wg(xi) and its exact gradient have zero
+        dependence on theta -- all theta-dependence enters only through the equilibrium constraint built by
+        _build_mpec_constraint_function.
+
+        Residualizing is an orthogonal projection onto the complement of the fixed effects' column span (the
+        Frisch-Waugh-Lovell theorem referenced in the docs' background section), so M is self-adjoint; the same
+        self._absorb_demand_ids call is therefore reused below to apply M's transpose when forming the gradient.
         """
         P = parameters.P
         X1 = self.products.X1[:, parameters.eliminated_beta_index.flat]
@@ -1059,9 +1068,22 @@ class ProblemEconomy(Economy):
         def objective_function(x: Array) -> Tuple[float, Array]:
             """Compute the MPEC objective and its gradient at the stacked (theta, delta) vector."""
             delta = np.c_[x[P:]]
-            mean_g = (A @ (ZD.T @ delta)) / self.N
+            iv_delta = delta
+            if self._absorb_demand_ids is not None:
+                iv_delta, absorption_errors = self._absorb_demand_ids(delta)
+                if absorption_errors:
+                    self._handle_errors(absorption_errors, error_behavior)
+
+            mean_g = (A @ (ZD.T @ iv_delta)) / self.N
             objective = float(np.squeeze(mean_g.T @ W_demand @ mean_g))
-            gradient_delta = (2.0 / self.N) * (ZD @ (A.T @ (W_demand @ mean_g)))
+
+            gradient_delta = ZD @ (A.T @ (W_demand @ mean_g))
+            if self._absorb_demand_ids is not None:
+                gradient_delta, absorption_errors = self._absorb_demand_ids(gradient_delta)
+                if absorption_errors:
+                    self._handle_errors(absorption_errors, error_behavior)
+            gradient_delta = (2.0 / self.N) * gradient_delta
+
             if scale_objective:
                 objective *= self.N
                 gradient_delta *= self.N
@@ -1157,7 +1179,7 @@ class ProblemEconomy(Economy):
         delta, holding as equality constraints.
         """
         assert iv is not None
-        objective_function = self._build_mpec_objective_function(parameters, iv, W, scale_objective)
+        objective_function = self._build_mpec_objective_function(parameters, iv, W, scale_objective, error_behavior)
         constraint_function = self._build_mpec_constraint_function(parameters, error_behavior)
         return optimization._optimize_mpec(theta, delta, theta_bounds, objective_function, constraint_function)
 

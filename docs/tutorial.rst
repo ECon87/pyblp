@@ -12,6 +12,7 @@ In addition to the notebooks here and the above workshop, other examples can be 
 
    _notebooks/tutorial/logit_nested.ipynb
    _notebooks/tutorial/nevo.ipynb
+   _notebooks/tutorial/mpec.ipynb
    _notebooks/tutorial/blp.ipynb
    _notebooks/tutorial/petrin.ipynb
    _notebooks/tutorial/post_estimation.ipynb
