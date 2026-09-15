@@ -15,7 +15,10 @@ from .. import exceptions, options
 from ..configurations.formulation import Formulation
 from ..configurations.integration import Integration
 from ..configurations.iteration import Iteration
-from ..configurations.optimization import ObjectiveResults, Optimization, OptimizationProgress
+from ..configurations.optimization import (
+    MPECConstraintFunction, MPECObjectiveFunction, ObjectiveResults, Optimization, OptimizationProgress
+)
+from ..markets.mpec_market import MPECMarket
 from ..markets.problem_market import ProblemMarket
 from ..micro import MicroDataset, MicroMoment, Moments
 from ..parameters import Parameters, PhiParameter
@@ -325,6 +328,18 @@ class ProblemEconomy(Economy):
             starting values, verifying that :math:`\hat{\theta}` satisfies both the first and second order conditions.
             Choosing a routine that supports bounds (and configuring bounds) is typically a good idea. Choosing a
             routine that does not use analytic gradients will often down estimation.
+
+            Also supported are ``Optimization('mpec-trust-constr')`` and ``Optimization('mpec-knitro')``, which use
+            the MPEC (mathematical program with equilibrium constraints) approach of
+            :ref:`references:Dubé, Fox, and Su (2012)`: rather than solving the fixed point problem for
+            :math:`\delta(\theta)` inside every objective evaluation, :math:`\delta` is instead treated as a free
+            variable and the market share equations are imposed as nonlinear equality constraints. This tends to
+            avoid the numerical error associated with the nested fixed point (NFP) approach used by all other
+            methods, and can be faster. These methods currently only support demand-side estimation: there must be no
+            supply side, no micro moments, no covariance moments, ``demand_moment_types`` must be ``'levels'``, and
+            ``beta`` must be fully concentrated out (its default configuration). ``iteration`` and ``fp_type`` are
+            still used, but only for a single finalization pass after MPEC converges (to compute the same Jacobians
+            used for standard errors as the NFP approach), and ``delta_behavior`` has no effect.
         scale_objective : `bool, optional`
             Whether to scale the objective in :eq:`objective` by :math:`N`, the number of observations, in which case
             the objective after two GMM steps is equal to the :math:`J` statistic from :ref:`references:Hansen (1982)`.
@@ -721,6 +736,7 @@ class ProblemEconomy(Economy):
         )
         theta = parameters.compress()
         theta_bounds = parameters.compress_bounds()
+        self._validate_mpec(optimization, parameters, moments, demand_moment_types, supply_moment_types)
         if parameters.fixed or parameters.unfixed:
             output("")
             output(parameters.format("Initial Values"))
@@ -908,7 +924,13 @@ class ProblemEconomy(Economy):
             if parameters.P > 0 and step > 0:
                 output(f"Starting optimization ...")
                 output("")
-                theta, optimization_stats = optimization._optimize(theta, theta_bounds, wrapper)
+                if optimization._is_mpec:
+                    theta, delta, optimization_stats = self._solve_mpec(
+                        parameters, iv, W, theta, delta, theta_bounds, optimization, scale_objective, error_behavior
+                    )
+                    progress.delta = progress.next_delta = delta
+                else:
+                    theta, optimization_stats = optimization._optimize(theta, theta_bounds, wrapper)
                 status = "completed" if optimization_stats.converged else "failed"
                 optimization_end_time = time.time()
                 optimization_time = optimization_end_time - optimization_start_time
@@ -984,6 +1006,160 @@ class ProblemEconomy(Economy):
             W = results.updated_W
             step += 1
             step_start_time = time.time()
+
+    def _validate_mpec(
+        self,
+        optimization: Optimization,
+        parameters: Parameters,
+        moments: Moments,
+        demand_moment_types: Sequence[Tuple[str, int]],
+        supply_moment_types: Sequence[Tuple[str, int]],
+    ) -> None:
+        """Validate that the configured problem is compatible with an MPEC optimization method."""
+        if not optimization._is_mpec:
+            return
+        if self.K2 == 0:
+            raise ValueError(
+                "MPEC methods are not needed when there are no nonlinear parameters (sigma and pi are both empty), "
+                "since delta already has a closed-form solution in this case."
+            )
+        if self.K3 > 0:
+            raise NotImplementedError("MPEC methods do not currently support a supply side.")
+        if moments.MM > 0:
+            raise NotImplementedError("MPEC methods do not currently support micro moments.")
+        if self.MC > 0:
+            raise NotImplementedError("MPEC methods do not currently support covariance moments.")
+        if not parameters.eliminated_beta_index.all():
+            raise NotImplementedError(
+                "MPEC methods currently require that beta be fully concentrated out, which is its default "
+                "configuration (do not specify initial, non-NaN values for beta)."
+            )
+        if any(t != 'levels' for t, _ in demand_moment_types) or any(t != 'levels' for t, _ in supply_moment_types):
+            raise NotImplementedError("MPEC methods currently only support 'levels' demand_moment_types.")
+        if any(isinstance(p, PhiParameter) for p in parameters.unfixed):
+            raise NotImplementedError("MPEC methods do not currently support unfixed phi (autocorrelation) parameters.")
+
+    def _build_mpec_objective_function(
+        self, parameters: Parameters, iv: IV, W: Array, scale_objective: bool,
+    ) -> MPECObjectiveFunction:
+        """Build a function that computes the MPEC objective and its gradient at a stacked (theta, delta) vector.
+
+        With beta fully concentrated out, no supply side, and 'levels' demand moments (all enforced by
+        _validate_mpec), xi = (I - X1 @ iv.covariances @ (X1'ZD) @ W) @ delta is an affine function of delta alone:
+        X1, ZD, iv.covariances, and W are all fixed within a GMM step and do not depend on theta. Hence the GMM
+        objective g(xi)'Wg(xi) and its exact gradient have zero dependence on theta -- all theta-dependence enters
+        only through the equilibrium constraint built by _build_mpec_constraint_function.
+        """
+        P = parameters.P
+        X1 = self.products.X1[:, parameters.eliminated_beta_index.flat]
+        ZD = self.products.ZD
+        W_demand = W[:self.MD, :self.MD]
+        A = np.eye(self.MD, dtype=options.dtype) - (ZD.T @ X1) @ iv.covariances @ (X1.T @ ZD) @ W_demand
+
+        def objective_function(x: Array) -> Tuple[float, Array]:
+            """Compute the MPEC objective and its gradient at the stacked (theta, delta) vector."""
+            delta = np.c_[x[P:]]
+            mean_g = (A @ (ZD.T @ delta)) / self.N
+            objective = float(np.squeeze(mean_g.T @ W_demand @ mean_g))
+            gradient_delta = (2.0 / self.N) * (ZD @ (A.T @ (W_demand @ mean_g)))
+            if scale_objective:
+                objective *= self.N
+                gradient_delta *= self.N
+            gradient = np.r_[np.zeros((P, 1), options.dtype), gradient_delta]
+            return objective, gradient
+
+        return objective_function
+
+    def _build_mpec_constraint_function(self, parameters: Parameters, error_behavior: str) -> MPECConstraintFunction:
+        """Build a function that computes the MPEC equilibrium constraint residuals (simulated shares minus observed
+        shares, evaluated at a free delta) and the Jacobian of these constraints with respect to the stacked
+        (theta, delta) vector, market by market. The Jacobian's sparsity pattern (which entries are structurally
+        nonzero) does not depend on parameter values, so it is computed once: a dense-in-theta block (every theta
+        component can affect every market) and a block-diagonal-in-delta block (a market's delta only affects that
+        market's own share equations).
+        """
+        P = parameters.P
+
+        # precompute the fixed sparsity pattern of the Jacobian, along with per-market slices into the flat data
+        # arrays so that market-level results can be written to the correct position regardless of the (possibly
+        # unordered, when using a process pool) order in which they are computed
+        theta_slices: Dict[Hashable, slice] = {}
+        delta_slices: Dict[Hashable, slice] = {}
+        theta_row_parts: List[Array] = []
+        theta_col_parts: List[Array] = []
+        delta_row_parts: List[Array] = []
+        delta_col_parts: List[Array] = []
+        theta_offset = delta_offset = 0
+        for t in self.unique_market_ids:
+            idx = self._product_market_indices[t]
+            J_t = idx.size
+            theta_slices[t] = slice(theta_offset, theta_offset + J_t * P)
+            delta_slices[t] = slice(delta_offset, delta_offset + J_t * J_t)
+            theta_row_parts.append(np.repeat(idx, P))
+            theta_col_parts.append(np.tile(np.arange(P), J_t))
+            delta_row_parts.append(np.repeat(idx, J_t))
+            delta_col_parts.append(np.tile(idx, J_t) + P)
+            theta_offset += J_t * P
+            delta_offset += J_t * J_t
+        theta_total, delta_total = theta_offset, delta_offset
+        jac_rows = np.concatenate([*theta_row_parts, *delta_row_parts]).astype(np.int64)
+        jac_cols = np.concatenate([*theta_col_parts, *delta_col_parts]).astype(np.int64)
+
+        def constraint_function(x: Array) -> Tuple[Array, Array, Array, Array]:
+            """Compute the constraint residual and Jacobian data (in the order given by jac_rows/jac_cols above) at
+            the stacked (theta, delta) vector.
+            """
+            theta = x[:P]
+            delta = np.c_[x[P:]]
+            sigma, pi, rho, _, beta, _ = parameters.expand(theta)
+
+            def market_factory(s: Hashable) -> Tuple[MPECMarket, Array, bool]:
+                """Build a market along with arguments used to compute the constraint residual and Jacobian."""
+                market_s = MPECMarket(self, s, parameters, sigma, pi, rho, beta)
+                delta_s = delta[self._product_market_indices[s]]
+                return market_s, delta_s, True
+
+            residual = np.zeros((self.N, 1), options.dtype)
+            theta_data = np.zeros(theta_total, options.dtype)
+            delta_data = np.zeros(delta_total, options.dtype)
+            errors: List[Error] = []
+            generator = generate_items(self.unique_market_ids, market_factory, MPECMarket.solve_constraint)
+            for t, generated_t in generator:
+                shares_t, shares_by_delta_jacobian_t, shares_by_theta_jacobian_t, errors_t = generated_t
+                idx = self._product_market_indices[t]
+                residual[idx] = shares_t - self.products.shares[idx]
+                theta_data[theta_slices[t]] = shares_by_theta_jacobian_t.flatten()
+                delta_data[delta_slices[t]] = shares_by_delta_jacobian_t.flatten()
+                errors.extend(errors_t)
+
+            if errors:
+                self._handle_errors(errors, error_behavior)
+
+            jac_data = np.concatenate([theta_data, delta_data])
+            return residual.flatten(), jac_rows, jac_cols, jac_data
+
+        return constraint_function
+
+    def _solve_mpec(
+        self,
+        parameters: Parameters,
+        iv: Optional[IV],
+        W: Array,
+        theta: Array,
+        delta: Array,
+        theta_bounds: Optional[Sequence[Tuple[float, float]]],
+        optimization: Optimization,
+        scale_objective: bool,
+        error_behavior: str,
+    ) -> Tuple[Array, Array, SolverStats]:
+        """Jointly solve for theta and delta via the MPEC formulation: minimize the GMM objective (which, given beta
+        fully concentrated out, depends only on delta) subject to the market share equations, evaluated at a free
+        delta, holding as equality constraints.
+        """
+        assert iv is not None
+        objective_function = self._build_mpec_objective_function(parameters, iv, W, scale_objective)
+        constraint_function = self._build_mpec_constraint_function(parameters, error_behavior)
+        return optimization._optimize_mpec(theta, delta, theta_bounds, objective_function, constraint_function)
 
     def _compute_progress(
         self,

@@ -74,6 +74,17 @@ class DeltaNumericalError(NumericalError):
     """
 
 
+class MPECConstraintNumericalError(NumericalError):
+    r"""Encountered a numerical error when computing MPEC equilibrium constraints (the share equations evaluated at a
+    free :math:`\delta`) or their Jacobian.
+
+    This problem is often due to overflow from extreme parameter or :math:`\delta` values proposed by the optimizer,
+    and can sometimes be mitigated by choosing smaller initial parameter values, setting more conservative bounds on
+    parameters, rescaling data, or removing outliers.
+
+    """
+
+
 class CostsNumericalError(NumericalError):
     """Encountered a numerical error when computing marginal costs.
 

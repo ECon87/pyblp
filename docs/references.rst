@@ -103,6 +103,12 @@ Conlon and Mortimer (2021)
 Conlon, Christopher, and Julie H. Mortimer (2021). `Empirical properties of diversion ratios <https://chrisconlon.github.io/site/diversion.pdf>`_. *RAND Journal of Economics, 52* (4), 693-726.
 
 
+Dubé, Fox, and Su (2012)
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Dubé, Jean-Pierre, Jeremy T. Fox, and Che-Lin Su (2012). `Improving the numerical performance of static and dynamic aggregate discrete choice random coefficients demand estimation <https://doi.org/10.3982/ECTA8585>`_. *Econometrica, 80* (5), 2231-2267.
+
+
 Frisch and Waugh (1933)
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -227,6 +233,12 @@ Reynaerts, Varadhan, and Nash (2012)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Reynaerts, Jo, Ravi Varadhan, and John C. Nash (2012). `Enhancing the convergence properties of the BLP (1995) contraction mapping <https://ideas.repec.org/p/ete/vivwps/35.html>`_. VIVES discussion paper 35.
+
+
+Su and Judd (2012)
+~~~~~~~~~~~~~~~~~~
+
+Su, Che-Lin, and Kenneth L. Judd (2012). `Constrained optimization approaches to estimation of structural models <https://doi.org/10.3982/ECTA8617>`_. *Econometrica, 80* (5), 2213-2230.
 
 
 Varadhan and Roland (2008)

@@ -1,5 +1,7 @@
 """Tests of optimization routines."""
 
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -91,3 +93,40 @@ def test_entropy(
     exact = objective_function(exact_values)[0]
     estimated = objective_function(estimated_values)[0]
     np.testing.assert_allclose(estimated, exact, rtol=1e-5, atol=0)
+
+
+@pytest.mark.parametrize('method', [
+    pytest.param('mpec-trust-constr', id="SciPy Trust Region"),
+    pytest.param('mpec-knitro', id="Knitro"),
+])
+def test_mpec_toy_problem(method: str) -> None:
+    """Test that Optimization._optimize_mpec solves a simple equality-constrained quadratic problem:
+
+        min_{x,y} (x - 1)^2 + (y - 2)^2   subject to   x + y = 5
+
+    which has the exact solution x = 2, y = 3 (by the method of Lagrange multipliers).
+    """
+    def objective_function(x: Array) -> Any:
+        """Evaluate the objective and its gradient."""
+        return (x[0] - 1) ** 2 + (x[1] - 2) ** 2, np.array([2 * (x[0] - 1), 2 * (x[1] - 2)])
+
+    def constraint_function(x: Array) -> Any:
+        """Evaluate the constraint residual and its (fixed-sparsity-pattern) Jacobian."""
+        residual = np.array([x[0] + x[1] - 5.0])
+        rows = np.array([0, 0])
+        cols = np.array([0, 1])
+        data = np.array([1.0, 1.0])
+        return residual, rows, cols, data
+
+    # skip optimization methods that haven't been configured properly
+    try:
+        optimization = Optimization(method)
+    except OSError as exception:
+        return pytest.skip(f"Failed to use the {method} method in this environment: {exception}.")
+
+    theta, delta, stats = optimization._optimize_mpec(
+        np.array([[0.0]]), np.array([[0.0]]), [(-10.0, 10.0)], objective_function, constraint_function
+    )
+    assert stats.converged
+    np.testing.assert_allclose(theta.flatten(), [2.0], atol=1e-4)
+    np.testing.assert_allclose(delta.flatten(), [3.0], atol=1e-4)

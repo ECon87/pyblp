@@ -10,6 +10,7 @@ from typing import Any, Callable, Iterable, Iterator, List, Optional, Tuple, Uni
 
 import numpy as np
 import scipy.optimize
+import scipy.sparse
 
 from .. import options
 from ..utilities.basics import Array, Bounds, Options, SolverStats, StringRepresentation, format_options
@@ -18,6 +19,13 @@ from ..utilities.basics import Array, Bounds, Options, SolverStats, StringRepres
 # objective function types
 ObjectiveResults = Tuple[float, Optional[Array], Optional['OptimizationProgress']]
 ObjectiveFunction = Callable[[Array], ObjectiveResults]
+
+# MPEC objective and constraint function types: the objective function takes the full stacked (theta, delta) vector
+#   and returns an objective value and its gradient; the constraint function takes the same stacked vector and
+#   returns the equilibrium constraint residuals (the share equations evaluated at a free delta, minus observed
+#   shares) along with the row indices, column indices, and values of its (fixed-sparsity-pattern) Jacobian
+MPECObjectiveFunction = Callable[[Array], Tuple[float, Array]]
+MPECConstraintFunction = Callable[[Array], Tuple[Array, Array, Array, Array]]
 
 # only import objects that create import cycles when checking types
 if TYPE_CHECKING:
@@ -69,6 +77,23 @@ class Optimization(StringRepresentation):
         The following trivial routine can be used to evaluate an objective at specific parameter values:
 
             - ``'return'`` - Assume that the initial parameter values are the optimal ones.
+
+        The following routines implement the MPEC (mathematical program with equilibrium constraints) approach of
+        `Dubé, Fox, and Su (2012) <https://doi.org/10.3982/ECTA8585>`_, building on `Su and Judd (2012)
+        <https://doi.org/10.3982/ECTA8617>`_: rather than nesting a fixed point iteration to invert market shares for
+        :math:`\delta(\theta)` inside every objective evaluation (the standard nested fixed point, or NFP, approach
+        used by all other methods above), :math:`\delta` is treated as a free variable and the market share equations
+        are imposed as nonlinear equality constraints. Su and Judd (2012) show this produces the same statistical
+        estimator as NFP while typically being faster and avoiding numerical error from the inner loop. MPEC methods
+        are currently only supported for demand-side estimation without a supply side or micro moments, and require
+        that :math:`\beta` be fully concentrated out (its default configuration).
+
+            - ``'mpec-trust-constr'`` - Uses the :func:`scipy.optimize.minimize` trust-region routine with the
+              equilibrium constraints imposed via :class:`scipy.optimize.NonlinearConstraint`.
+
+            - ``'mpec-knitro'`` - Uses an installed version of Artleys Knitro's modern object-oriented API (``KN_*``,
+              Knitro 12+), which natively supports general nonlinear constraints. The legacy ``KTR_*`` API does not
+              support this method.
 
         Also accepted is a custom callable method with the following form::
 
@@ -156,6 +181,7 @@ class Optimization(StringRepresentation):
     _supports_bounds: bool
     _compute_gradient: bool
     _universal_display: bool
+    _is_mpec: bool
 
     def __init__(
             self, method: Union[str, Callable], method_options: Optional[Options] = None, compute_gradient: bool = True,
@@ -178,7 +204,17 @@ class Optimization(StringRepresentation):
             'knitro': (functools.partial(knitro_optimizer), "an installed version of Artleys Knitro"),
             'return': (functools.partial(return_optimizer), "a trivial routine that returns the initial parameters")
         }
-        methods = {**simple_methods, **unbounded_methods, **bounded_methods}
+        mpec_methods = {
+            'mpec-trust-constr': (
+                functools.partial(scipy_mpec_optimizer),
+                "the MPEC formulation solved with the SciPy trust-region routine"
+            ),
+            'mpec-knitro': (
+                functools.partial(knitro_mpec_optimizer),
+                "the MPEC formulation solved with an installed version of Artleys Knitro"
+            ),
+        }
+        methods = {**simple_methods, **unbounded_methods, **bounded_methods, **mpec_methods}
 
         # validate the configuration
         if method not in methods and not callable(method):
@@ -189,11 +225,14 @@ class Optimization(StringRepresentation):
             raise ValueError(f"compute_gradient must be False when method is '{method}'.")
         if method == 'newton-cg' and not compute_gradient:
             raise ValueError(f"compute_gradient must be True when method is '{method}'.")
+        if method in mpec_methods and not compute_gradient:
+            raise ValueError(f"compute_gradient must be True when method is '{method}'.")
 
         # initialize class attributes
         self._compute_gradient = compute_gradient
         self._universal_display = universal_display
-        self._supports_bounds = callable(method) or method in bounded_methods
+        self._supports_bounds = callable(method) or method in bounded_methods or method in mpec_methods
+        self._is_mpec = method in mpec_methods
 
         # options are by default empty
         if method_options is None:
@@ -210,7 +249,7 @@ class Optimization(StringRepresentation):
         self._method_options: Options = {}
         self._optimizer, self._description = methods[method]
         self._optimizer = functools.partial(self._optimizer, compute_gradient=compute_gradient)
-        if method == 'knitro':
+        if method in {'knitro', 'mpec-knitro'}:
             self._method_options.update({
                 'hessopt': 2,
                 'algorithm': 1,
@@ -219,6 +258,9 @@ class Optimization(StringRepresentation):
                 'knitro_dir': os.environ.get('KNITRODIR'),
                 'outlev': 4 if not universal_display and options.verbose else 0
             })
+        elif method == 'mpec-trust-constr':
+            if not universal_display and options.verbose:
+                self._method_options['verbose'] = 3
         elif method != 'return':
             self._optimizer = functools.partial(self._optimizer, method=method)
             if not universal_display and options.verbose:
@@ -234,7 +276,7 @@ class Optimization(StringRepresentation):
         # validate options for non-SciPy routines
         if method == 'return' and self._method_options:
             raise ValueError("The return method does not support any options.")
-        if method == 'knitro':
+        if method in {'knitro', 'mpec-knitro'}:
             # get the location of the Knitro installation
             knitro_dir = self._method_options.pop('knitro_dir')
             if not isinstance(knitro_dir, (Path, str)):
@@ -305,6 +347,62 @@ class Optimization(StringRepresentation):
         final = np.asanyarray(raw_final).astype(initial.dtype, copy=False).reshape(initial.shape)
         stats = SolverStats(converged, iterations, evaluations)
         return final, stats
+
+    def _optimize_mpec(
+        self,
+        initial_theta: Array,
+        initial_delta: Array,
+        theta_bounds: Optional[Iterable[Tuple[float, float]]],
+        objective_function: MPECObjectiveFunction,
+        constraint_function: MPECConstraintFunction,
+    ) -> Tuple[Array, Array, SolverStats]:
+        """Jointly optimize theta and delta to minimize a scalar objective subject to the MPEC equilibrium
+        constraints.
+        """
+        assert self._is_mpec
+        P = initial_theta.size
+
+        # initialize counters
+        iterations = evaluations = 0
+
+        def iteration_callback() -> None:
+            """Count the number of major iterations."""
+            nonlocal iterations
+            iterations += 1
+
+        def objective_wrapper(raw_values: Any) -> Tuple[float, Array]:
+            """Normalize arrays so they work with all types of routines. Also count the total number of objective
+            evaluations.
+            """
+            nonlocal evaluations
+            evaluations += 1
+            raw_values = np.asanyarray(raw_values, dtype=np.float64).flatten()
+            objective, gradient = objective_function(raw_values)
+            return float(np.squeeze(objective)), np.asarray(gradient, dtype=np.float64).flatten()
+
+        def constraint_wrapper(raw_values: Any) -> Tuple[Array, Array, Array, Array]:
+            """Normalize arrays so they work with all types of routines."""
+            raw_values = np.asanyarray(raw_values, dtype=np.float64).flatten()
+            return constraint_function(raw_values)
+
+        # normalize values
+        raw_initial = np.r_[
+            np.asarray(initial_theta, dtype=np.float64).flatten(), np.asarray(initial_delta, dtype=np.float64).flatten()
+        ]
+        raw_theta_bounds = (
+            [(-np.inf, +np.inf)] * P if theta_bounds is None else [(float(l), float(u)) for l, u in theta_bounds]
+        )
+        raw_bounds = raw_theta_bounds + [(-np.inf, +np.inf)] * initial_delta.size
+
+        # solve the problem and split the raw final values back into theta and delta
+        raw_final, converged = self._optimizer(
+            raw_initial, raw_bounds, objective_wrapper, constraint_wrapper, iteration_callback, **self._method_options
+        )
+        raw_final = np.asanyarray(raw_final, dtype=np.float64).flatten()
+        theta = raw_final[:P].astype(initial_theta.dtype, copy=False).reshape(initial_theta.shape)
+        delta = raw_final[P:].astype(initial_delta.dtype, copy=False).reshape(initial_delta.shape)
+        stats = SolverStats(converged, iterations, evaluations)
+        return theta, delta, stats
 
 
 class OptimizationProgress(object):
@@ -565,6 +663,77 @@ def scipy_optimizer(
     return results.x, results.success
 
 
+def scipy_mpec_optimizer(
+    initial_values: Array,
+    bounds: Optional[Iterable[Tuple[float, float]]],
+    objective_function: Callable[[Array], Tuple[float, Array]],
+    constraint_function: Callable[[Array], Tuple[Array, Array, Array, Array]],
+    iteration_callback: Callable[[], None],
+    compute_gradient: bool,
+    **scipy_options: Any,
+) -> Tuple[Array, bool]:
+    """Solve the MPEC formulation with SciPy's trust-region routine, imposing the equilibrium constraints via a
+    sparse NonlinearConstraint.
+    """
+    assert compute_gradient
+
+    objective_cache: Optional[Tuple[Array, Tuple[float, Array]]] = None
+
+    def cached_objective(values: Array) -> Tuple[float, Array]:
+        nonlocal objective_cache
+        if objective_cache is None or not np.array_equal(values, objective_cache[0]):
+            objective_cache = (values.copy(), objective_function(values))
+        return objective_cache[1]
+
+    def objective_wrapper(values: Array) -> float:
+        return cached_objective(values)[0]
+
+    def gradient_wrapper(values: Array) -> Array:
+        return cached_objective(values)[1]
+
+    constraint_cache: Optional[Tuple[Array, Tuple[Array, Array, Array, Array]]] = None
+
+    def cached_constraint(values: Array) -> Tuple[Array, Array, Array, Array]:
+        nonlocal constraint_cache
+        if constraint_cache is None or not np.array_equal(values, constraint_cache[0]):
+            constraint_cache = (values.copy(), constraint_function(values))
+        return constraint_cache[1]
+
+    def constraint_residual_wrapper(values: Array) -> Array:
+        residual, _, _, _ = cached_constraint(values)
+        return residual
+
+    def constraint_jacobian_wrapper(values: Array) -> scipy.sparse.csr_matrix:
+        residual, rows, cols, data = cached_constraint(values)
+        return scipy.sparse.csr_matrix((data, (rows, cols)), shape=(residual.size, values.size))
+
+    constraint = scipy.optimize.NonlinearConstraint(
+        fun=constraint_residual_wrapper, lb=0.0, ub=0.0, jac=constraint_jacobian_wrapper
+    )
+
+    # by default use the BFGS approximation for the Lagrangian Hessian: no analytic second derivatives are provided
+    hess = scipy_options.pop('hess', scipy.optimize.BFGS())
+
+    # extract and configure any bound feasibility
+    if 'keep_feasible' in scipy_options:
+        if bounds is not None:
+            lb, ub = zip(*bounds)
+            bounds = scipy.optimize.Bounds(lb, ub, scipy_options['keep_feasible'])
+        scipy_options = scipy_options.copy()
+        del scipy_options['keep_feasible']
+
+    # SciPy's equality-constrained trust-region internals (used only when general constraints are configured, as
+    #   opposed to simple bounds) can harmlessly underflow while computing barrier parameters and Lagrange
+    #   multiplier updates near a solution; relax NumPy's error mode so this doesn't propagate as an exception
+    callback = lambda *_: iteration_callback()
+    with np.errstate(under='ignore'):
+        results = scipy.optimize.minimize(
+            objective_wrapper, initial_values, method='trust-constr', jac=gradient_wrapper, hess=hess, bounds=bounds,
+            constraints=[constraint], callback=callback, options=scipy_options
+        )
+    return results.x, results.success
+
+
 def knitro_optimizer(
     initial_values: Array,
     bounds: Optional[Iterable[Tuple[float, float]]],
@@ -649,6 +818,155 @@ def knitro_optimizer_kn(
         knitro.KN_set_cb_grad(
             knitro_context, callback, objGradIndexVars=knitro.KN_DENSE, gradCallback=gradient_callback
         )
+
+    # configure Knitro user options, dispatching by value type (Knitro still accepts legacy string option names)
+    for key, value in knitro_options.items():
+        try:
+            if isinstance(value, str):
+                knitro.KN_set_char_param(knitro_context, key, value)
+            elif isinstance(value, float):
+                knitro.KN_set_double_param(knitro_context, key, value)
+            else:
+                knitro.KN_set_int_param(knitro_context, key, value)
+        except Exception as exception:
+            raise RuntimeError(f"Encountered an error when configuring '{key}'.") from exception
+
+    # solve the problem and extract the solution
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        knitro.KN_solve(knitro_context)
+    return_code, _, values, _ = knitro.KN_get_solution(knitro_context)
+
+    # Knitro was only successful if its return code was 0 (final solution satisfies the termination conditions for
+    #   verifying optimality) or between -100 and -199 (a feasible approximate solution was found)
+    return np.asarray(values, dtype=np.float64), return_code > -200
+
+
+def knitro_mpec_optimizer(
+    initial_values: Array,
+    bounds: Optional[Iterable[Tuple[float, float]]],
+    objective_function: Callable[[Array], Tuple[float, Array]],
+    constraint_function: Callable[[Array], Tuple[Array, Array, Array, Array]],
+    iteration_callback: Callable[[], None],
+    compute_gradient: bool,
+    **knitro_options: Any,
+) -> Tuple[Array, bool]:
+    """Solve the MPEC formulation with Knitro's modern object-oriented API (``KN_*``, Knitro 12+), which is required
+    for general nonlinear constraint support.
+    """
+    with knitro_context_manager() as (knitro, knitro_context):
+        if not hasattr(knitro, 'KN_new'):
+            raise EnvironmentError(
+                "The 'mpec-knitro' method requires Knitro 12 or newer, which exposes the modern KN_* API. The "
+                "legacy KTR_* API does not support the general nonlinear constraints that MPEC requires."
+            )
+        return knitro_mpec_optimizer_kn(
+            knitro, knitro_context, initial_values, bounds, objective_function, constraint_function,
+            iteration_callback, compute_gradient, **knitro_options
+        )
+
+
+def knitro_mpec_optimizer_kn(
+    knitro: Any,
+    knitro_context: Any,
+    initial_values: Array,
+    bounds: Optional[Iterable[Tuple[float, float]]],
+    objective_function: Callable[[Array], Tuple[float, Array]],
+    constraint_function: Callable[[Array], Tuple[Array, Array, Array, Array]],
+    iteration_callback: Callable[[], None],
+    compute_gradient: bool,
+    **knitro_options: Any,
+) -> Tuple[Array, bool]:
+    """Solve the MPEC formulation with the modern object-oriented Knitro API (``KN_*``), registering the equilibrium
+    constraints and their (fixed-sparsity-pattern) Jacobian alongside the objective and its gradient.
+    """
+    assert compute_gradient
+    iterations = 0
+    objective_cache: Optional[Tuple[Array, Tuple[float, Array]]] = None
+    constraint_cache: Optional[Tuple[Array, Tuple[Array, Array, Array, Array]]] = None
+    jacobian_pattern: Optional[Tuple[Array, Array]] = None
+
+    def evaluate_objective(values: Array) -> Tuple[float, Array]:
+        """Compute the objective and its gradient, caching so the gradient callback avoids recomputation."""
+        nonlocal objective_cache
+        if objective_cache is None or not np.array_equal(values, objective_cache[0]):
+            objective_cache = (values.copy(), objective_function(values))
+        return objective_cache[1]
+
+    def evaluate_constraint(values: Array) -> Tuple[Array, Array, Array, Array]:
+        """Compute the constraint residuals and Jacobian triplets, caching so the Jacobian callback avoids
+        recomputation. Also verify that the sparsity pattern stays fixed, as required to register it with Knitro
+        only once.
+        """
+        nonlocal constraint_cache, jacobian_pattern
+        if constraint_cache is None or not np.array_equal(values, constraint_cache[0]):
+            constraint_cache = (values.copy(), constraint_function(values))
+            _, rows, cols, _ = constraint_cache[1]
+            if jacobian_pattern is None:
+                jacobian_pattern = (np.asarray(rows), np.asarray(cols))
+            elif not (np.array_equal(rows, jacobian_pattern[0]) and np.array_equal(cols, jacobian_pattern[1])):
+                raise RuntimeError(
+                    "The sparsity pattern of the MPEC constraint Jacobian changed between evaluations, which "
+                    "violates the fixed sparsity pattern registered with Knitro."
+                )
+        return constraint_cache[1]
+
+    # define a function that normalizes values so they can be digested by Knitro
+    normalize = lambda x: min(max(float(np.squeeze(x)), -sys.maxsize), sys.maxsize)
+
+    def function_callback(_: Any, __: Any, request: Any, result: Any, ___: Any) -> int:
+        """Handle a request to compute the objective and constraints, calling the iteration callback on new major
+        iterations.
+        """
+        nonlocal iterations
+        current_iterations = knitro.KN_get_number_iters(knitro_context)
+        while iterations < current_iterations:
+            iteration_callback()
+            iterations += 1
+        values = np.asarray(request.x, dtype=np.float64)
+        objective, _ = evaluate_objective(values)
+        result.obj = normalize(objective)
+        residual, _, _, _ = evaluate_constraint(values)
+        for index, residual_value in enumerate(residual):
+            result.c[index] = normalize(residual_value)
+        return 0
+
+    def gradient_callback(_: Any, __: Any, request: Any, result: Any, ___: Any) -> int:
+        """Handle a request to compute the objective's gradient and the constraint Jacobian."""
+        values = np.asarray(request.x, dtype=np.float64)
+        _, gradient = evaluate_objective(values)
+        for index, gradient_value in enumerate(np.asarray(gradient).flatten()):
+            result.objGrad[index] = normalize(gradient_value)
+        _, _, _, data = evaluate_constraint(values)
+        for index, data_value in enumerate(data):
+            result.jac[index] = normalize(data_value)
+        return 0
+
+    # define the variables, their bounds, and their initial values
+    bounds = bounds or [(-np.inf, +np.inf)] * initial_values.size
+    infinity = knitro.KN_INFINITY
+    knitro.KN_add_vars(knitro_context, initial_values.size)
+    knitro.KN_set_var_lobnds(knitro_context, xLoBnds=[b[0] if np.isfinite(b[0]) else -infinity for b in bounds])
+    knitro.KN_set_var_upbnds(knitro_context, xUpBnds=[b[1] if np.isfinite(b[1]) else +infinity for b in bounds])
+    knitro.KN_set_var_primal_init_values(
+        knitro_context, xInitVals=[float(v) for v in np.asarray(initial_values).flatten()]
+    )
+    knitro.KN_set_obj_goal(knitro_context, knitro.KN_OBJGOAL_MINIMIZE)
+
+    # discover the number of constraints and the fixed sparsity pattern of their Jacobian from an initial evaluation
+    initial_residual, initial_rows, initial_cols, _ = evaluate_constraint(np.asarray(initial_values, dtype=np.float64))
+    knitro.KN_add_cons(knitro_context, initial_residual.size)
+    knitro.KN_set_con_eqbnds(knitro_context, cEqBnds=[0.0] * initial_residual.size)
+
+    # register the objective and constraint callbacks together, since Knitro allows a single callback to report both
+    callback = knitro.KN_add_eval_callback(
+        knitro_context, evalObj=True, indexCons=list(range(initial_residual.size)), funcCallback=function_callback
+    )
+    knitro.KN_set_cb_grad(
+        knitro_context, callback, objGradIndexVars=knitro.KN_DENSE,
+        jacIndexCons=[int(i) for i in initial_rows], jacIndexVars=[int(i) for i in initial_cols],
+        gradCallback=gradient_callback
+    )
 
     # configure Knitro user options, dispatching by value type (Knitro still accepts legacy string option names)
     for key, value in knitro_options.items():

@@ -1485,6 +1485,59 @@ def test_bounds(simulated_problem: SimulatedProblemFixture, method_info: Tuple[s
 
 
 @pytest.mark.usefixtures('simulated_problem')
+@pytest.mark.parametrize('mpec_method', [
+    pytest.param('mpec-trust-constr', id="SciPy Trust Region"),
+    pytest.param('mpec-knitro', id="Knitro"),
+])
+def test_mpec_matches_nfp(simulated_problem: SimulatedProblemFixture, mpec_method: str) -> None:
+    """Test that the MPEC formulation recovers the same parameter estimates, objective value, and standard errors as
+    the standard nested fixed point (NFP) approach used elsewhere in this test suite. MPEC currently only supports
+    demand-only estimation (no supply side, no micro moments, no covariance moments, 'levels' moment types only, and
+    beta fully concentrated out, which is enforced by pyblp itself). Like NFP, MPEC's solution can be sensitive to
+    its initial delta for harder problems (both are nonconvex), so this test warm-starts from the fixture's
+    already-solved NFP results, which also keeps the test's runtime bounded and is a legitimate real-world way to use
+    MPEC (e.g., to refine or double-check an NFP solution).
+    """
+    simulation, _, problem, solve_options, results = simulated_problem
+
+    if problem.K3 > 0:
+        return pytest.skip("MPEC does not currently support a supply side.")
+    if problem.MC > 0:
+        return pytest.skip("MPEC does not currently support covariance moments.")
+    if solve_options.get('micro_moments'):
+        return pytest.skip("MPEC does not currently support micro moments.")
+    if any(t != 'levels' for t, _ in solve_options['demand_moment_types']):
+        return pytest.skip("MPEC only currently supports 'levels' demand_moment_types.")
+    if problem.K2 == 0:
+        return pytest.skip("MPEC is not needed when there are no nonlinear parameters.")
+
+    # configure the MPEC method, skipping Knitro tests when it isn't installed or licensed in this environment
+    try:
+        optimization = Optimization(mpec_method)
+    except OSError as exception:
+        return pytest.skip(f"Failed to use the {mpec_method} method in this environment: {exception}.")
+
+    # warm-start from the fixture's already-solved NFP results
+    updated_solve_options = copy.deepcopy(solve_options)
+    updated_solve_options.update({
+        'sigma': results.sigma,
+        'pi': results.pi,
+        'rho': results.rho,
+        'optimization': optimization,
+    })
+    mpec_results = problem.solve(**updated_solve_options, delta=results.delta)
+
+    # test that parameter estimates, the objective, structural errors, and standard errors are close to the NFP
+    #   results computed by the fixture
+    np.testing.assert_allclose(mpec_results.theta, results.theta, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(mpec_results.objective, results.objective, atol=1e-8, rtol=1e-3)
+    np.testing.assert_allclose(mpec_results.xi, results.xi, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(mpec_results.beta, results.beta, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(mpec_results.sigma_se, results.sigma_se, atol=1e-3, rtol=1e-2)
+    np.testing.assert_allclose(mpec_results.beta_se, results.beta_se, atol=1e-3, rtol=1e-2)
+
+
+@pytest.mark.usefixtures('simulated_problem')
 def test_extra_nodes(simulated_problem: SimulatedProblemFixture) -> None:
     """Test that agents in a simulated problem are identical to agents in a problem created with agent data built
     according to the same integration specification but containing unnecessary columns of nodes.

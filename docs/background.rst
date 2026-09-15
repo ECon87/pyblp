@@ -165,6 +165,19 @@ The second term in this expression is derived from the definition of :math:`\eta
 One thing to note is that :math:`\frac{\partial\xi}{\partial\theta} = \frac{\partial\delta}{\partial\theta}` and :math:`\frac{\partial\omega}{\partial\theta} = \frac{\partial\tilde{c}}{\partial\theta}` need not hold during optimization if we concentrate out linear parameters because these are then functions of :math:`\theta`. Fortunately, one can use orthogonality conditions to show that it is fine to treat these parameters as fixed when computing the gradient.
 
 
+MPEC
+~~~~
+
+Rather than solving the contraction in :eq:`contraction` (or :eq:`nested_contraction`) inside every evaluation of :math:`q(\theta)`, the MPEC approach of :ref:`references:Dubé, Fox, and Su (2012)`, building on :ref:`references:Su and Judd (2012)`, instead treats :math:`\delta` as a free variable and imposes the market share equations as equality constraints:
+
+.. math:: \min_{\theta, \delta} \bar{g}(\delta)'W\bar{g}(\delta) \quad \text{subject to} \quad s(\delta, \theta) = s.
+   :label: mpec
+
+Because :math:`\hat{\beta}` in :eq:`iv` is concentrated out and :math:`\delta` is no longer an implicit function of :math:`\theta`, :math:`\bar{g}` in :eq:`mpec` reduces to an explicit (in fact affine) function of :math:`\delta` alone. Unlike :eq:`gradient`, its exact gradient therefore does not require the implicit function theorem at all: that only shows up in the Jacobian of the constraint :math:`s(\delta, \theta) - s = 0` with respect to :math:`\delta` and :math:`\theta`, which is supplied directly to the constrained optimizer instead of being inverted on every evaluation as in :eq:`gradient`. :ref:`references:Su and Judd (2012)` show that the first order conditions of :eq:`mpec` are equivalent to those of :eq:`objective`, so MPEC and the nested fixed point (NFP) approach described above give the same estimator; MPEC only changes how it is computed, which can avoid the numerical error associated with the contraction and can be faster.
+
+MPEC is configured by passing ``Optimization('mpec-trust-constr')`` or ``Optimization('mpec-knitro')`` to :meth:`Problem.solve`. It currently only supports demand-side estimation with :math:`\hat{\beta}` fully concentrated out (no supply side, no micro moments, and no covariance moments).
+
+
 Weighting Matrices
 ~~~~~~~~~~~~~~~~~~
 

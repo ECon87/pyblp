@@ -374,6 +374,7 @@ When errors occur, they will either be displayed as warnings or raised as except
    exceptions.InvalidMomentCovariancesError
    exceptions.GenericNumericalError
    exceptions.DeltaNumericalError
+   exceptions.MPECConstraintNumericalError
    exceptions.CostsNumericalError
    exceptions.MicroMomentsNumericalError
    exceptions.XiByThetaJacobianNumericalError
