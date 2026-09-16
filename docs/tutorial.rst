@@ -17,3 +17,4 @@ In addition to the notebooks here and the above workshop, other examples can be 
    _notebooks/tutorial/petrin.ipynb
    _notebooks/tutorial/post_estimation.ipynb
    _notebooks/tutorial/simulation.ipynb
+   _notebooks/tutorial/simulation_mpec.ipynb
